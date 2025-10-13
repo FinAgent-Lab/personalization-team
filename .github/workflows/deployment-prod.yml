@@ -1,0 +1,116 @@
+name: Deploy to Self-Hosted Runner
+
+on:
+  push:
+    branches: [ dev, develop ]
+#   workflow_dispatch:
+#     inputs:
+#       environment:
+#         description: '배포 환경 선택'
+#         required: true
+#         default: 'production'
+#         type: choice
+#         options:
+#           - production
+#           - staging
+
+jobs:
+  deploy:
+    name: Deploy to Finlab-1
+    runs-on: finlab-1
+    
+    steps:
+      - name: update permission
+        run: |
+          sudo chmod -R 777 /opt/actions-runner/_work
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Install required tools
+        run: |
+          # jq와 curl이 설치되어 있는지 확인하고 없으면 설치
+          if ! command -v jq &> /dev/null; then
+            echo "jq가 설치되어 있지 않습니다. 설치 중..."
+            sudo dnf install -y jq || sudo yum install -y jq
+          fi
+          
+          if ! command -v curl &> /dev/null; then
+            echo "curl이 설치되어 있지 않습니다. 설치 중..."
+            sudo dnf install -y curl || sudo yum install -y curl
+          fi
+          
+          echo "필요한 도구들이 설치되었습니다."
+          jq --version
+          curl --version
+      
+      - name: Set up environment variables
+        run: |
+          CURRENT_UID=$(id -u)
+          CURRENT_GID=$(id -g)
+          USER_NAME=$(whoami)
+          echo "USER_NAME: $USER_NAME"
+
+          cat > .env << EOF
+          PRODUCTION=${{ vars.PRODUCTION }}
+          APISERVER_PORT_EXTERNAL=8000
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL=${{ vars.OPENAI_BASE_URL }}
+          MAIN_LLM_MODEL=${{ vars.MAIN_LLM_MODEL }}
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          MILVUS_URL_RECAP=${{ vars.MILVUS_URL_RECAP }}
+          MILVUS_DB_NAME_RECAP=${{ vars.MILVUS_DB_NAME_RECAP }}
+          MILVUS_COLLECTION_NAME_RECAP=${{ vars.MILVUS_COLLECTION_NAME_RECAP }}
+          ALPHA_VANTAGE_API_KEY=${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CSE_ID=${{ vars.GOOGLE_CSE_ID }}
+          FINANCIAL_API_KEY=${{ secrets.FINANCIAL_API_KEY }}
+          LANGFUSE_ENABLED=${{ vars.LANGFUSE_ENABLED }}
+          LANGFUSE_SECRET_KEY=${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_PUBLIC_KEY=${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_HOST=${{ vars.LANGFUSE_HOST }}
+          FINANCIAL_DATASETS_API_KEY=${{ secrets.FINANCIAL_DATASETS_API_KEY }}
+          # UID=$CURRENT_UID
+          # GID=$CURRENT_GID
+          EOF
+      
+      - name: Clean Docker build cache
+        run: |
+          echo "=== Docker 빌드 캐시 정리 ==="
+          docker builder prune -af
+          
+      - name: Build and tag Docker images
+        run: |
+          # 캐시 없이 빌드 (--no-cache 옵션)
+          docker compose -f docker-compose.prod.yaml build --no-cache backend-ma
+      
+      - name: Stop running containers
+        run: |
+          docker compose -f docker-compose.prod.yaml down || true
+      
+      - name: Start Docker Compose services
+        run: |
+          docker compose -f docker-compose.prod.yaml up -d --remove-orphans
+      
+      - name: Check service availability 
+        run: |
+          echo "=== 방법 2: TCP 포트 연결 확인 ==="
+          
+          # netcat을 사용한 포트 체크 (더 안정적)
+          timeout 60 bash -c '
+            until nc -z localhost 8000; do
+              echo "포트 8000 연결 대기 중..."
+              sleep 2
+            done
+          '
+          echo "✅ 포트 8000에 연결 가능합니다."
+      
+      - name: Clean up old images
+        run: |
+          # 사용하지 않는 이미지 정리
+          docker image prune -af --filter "until=24h" || true
+
+    

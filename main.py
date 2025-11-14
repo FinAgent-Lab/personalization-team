@@ -8,10 +8,10 @@ import uvicorn
 from api.server import APIBuilder
 
 # from src.graph.nodes.us_financial_fmg import StockInfoNode
-from src.graph.nodes import (
-    NaverNewsSearcherNode,
-    USFinancialAnalyzerNode,
-)
+# from src.graph.nodes import (
+#     NaverNewsSearcherNode,
+#     USFinancialAnalyzerNode,
+# )
 from src.graph.nodes.rss_feeder import ChosunRSSFeederNode
 from src.graph.nodes.user_profile_chat import UserProfileChatNode
 from src.utils.logger import setup_logger

@@ -1,6 +1,6 @@
 """대화 상태 관리 서비스"""
 
-from typing import Dict, Optional
+from typing import Dict
 from src.models.user_profile import ConversationState
 
 

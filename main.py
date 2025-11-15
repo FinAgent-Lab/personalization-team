@@ -14,6 +14,7 @@ from api.server import APIBuilder
 # )
 from src.graph.nodes.rss_feeder import ChosunRSSFeederNode
 from src.graph.nodes.user_profile_chat import UserProfileChatNode
+from src.graph.nodes.condition_agent import ConditionAgentNode
 from src.utils.logger import setup_logger
 from src.graph.builder import SupervisorGraphBuilder
 
@@ -83,6 +84,8 @@ def main(
     graph_builder.add_node(ChosunRSSFeederNode())
     graph_builder.add_node(UserProfileChatNode())
     # graph_builder.add_node(USFinancialAnalyzerNode())  # TODO: 종합 처리 기능 적용 시 주석 해제
+
+    graph_builder.add_node(ConditionAgentNode())
 
     graph_builder.build()
 

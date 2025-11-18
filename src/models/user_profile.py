@@ -1,10 +1,32 @@
+"""
+유저 프로필 데이터 모델
+
+수집 필드 (총 12개):
+- 기본 정보: name_display, age_range, income_bracket
+- 투자 경험: invest_experience_yr, financial_knowledge_level
+- 투자 성향: risk_tolerance_level (1~5등급), preferred_style
+- 투자 목표: goal_type, goal_description
+- 자산 정보: total_investable_amt, current_holdings_note, preferred_asset_types
+
+위험등급 체계 (risk_tolerance_level):
+- 1등급 (초저위험형): 국공채형, MMF 등 선호
+- 2등급 (저위험형): 채권형, 원금보존 추구형 ELF/DLF 선호
+- 3등급 (중위험형): 채권혼합형, 원금부분보존 추구형 ELF/DLF 선호
+- 4등급 (고위험형): 주식혼합형, 인덱스펀드, 원금비보장형 ELF/DLF 선호
+- 5등급 (초고위험형): 주식형, 파생형 등 고위험 상품 선호
+"""
+
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, Field
 
 
 class UserProfile(BaseModel):
-    """유저 프로필 데이터 모델 (DB 저장용)"""
+    """
+    유저 프로필 데이터 모델 (DB 저장용)
+
+    총 12개 필드 수집 (created_at, updated_at 제외)
+    """
 
     user_id: str = Field(description="사용자 고유 ID")
     external_user_key: Optional[str] = Field(
@@ -21,8 +43,10 @@ class UserProfile(BaseModel):
         default=None, description="투자 경험 연수"
     )
     risk_tolerance_level: Optional[str] = Field(
-        default=None, description="리스크 허용 수준 (low/medium/high)"
+        default=None,
+        description="위험등급 (1등급: 초저위험형, 2등급: 저위험형, 3등급: 중위험형, 4등급: 고위험형, 5등급: 초고위험형)",
     )
+    # NOTE: LLM이 "저위험형" 등으로 반환 가능. UserProfileChatNode에서 자동 정규화됨
     goal_type: Optional[str] = Field(
         default=None, description="투자 목표 타입 (예: retirement, wealth_building)"
     )
@@ -60,7 +84,7 @@ class UserProfile(BaseModel):
                 "age_range": "30-39",
                 "income_bracket": "50M-100M",
                 "invest_experience_yr": 3,
-                "risk_tolerance_level": "medium",
+                "risk_tolerance_level": "3등급",
                 "goal_type": "retirement",
                 "goal_description": "55세 은퇴를 목표로 안정적인 노후 자금 마련",
                 "preferred_style": "balanced",
@@ -119,7 +143,12 @@ class ConversationState(BaseModel):
     is_completed: bool = Field(default=False, description="수집 완료 여부")
 
     def get_missing_fields(self) -> list[str]:
-        """아직 수집하지 못한 필드 목록 반환"""
+        """
+        아직 수집하지 못한 필드 목록 반환
+
+        NOTE: 이 메서드는 key 존재 여부만 확인합니다.
+        빈 값 체크는 UserProfileChatNode._get_truly_missing_fields()를 사용하세요.
+        """
         all_fields = [
             "name_display",
             "age_range",

@@ -9,7 +9,7 @@ import asyncio
 from typing import Dict, Any, List, Optional, Literal
 from enum import Enum
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 import httpx
 from langchain_core.messages import HumanMessage
@@ -23,6 +23,7 @@ from src.utils.logger import setup_logger
 # ===== Configuration =====
 class Config:
     """전역 설정 상수"""
+
     MAX_DATA_SOURCES = 10
     MAX_RETRIES = 2
     DEFAULT_CONFIDENCE = 0.8
@@ -41,22 +42,26 @@ class Config:
 # ===== Custom Exceptions =====
 class RoutingError(Exception):
     """라우팅 관련 에러"""
+
     pass
 
 
 class LLMError(Exception):
     """LLM 호출 관련 에러"""
+
     pass
 
 
 class ProfileError(Exception):
     """프로필 조회 관련 에러"""
+
     pass
 
 
 # ===== Enums and Data Classes =====
 class RouteType(Enum):
     """라우팅 타입 정의"""
+
     DEBATE = "debate_block"
     GUARDRAIL = "guardrail_layer"
     RETRIEVAL = "retrieval_pipeline"
@@ -76,6 +81,7 @@ class InvestmentAdvisorySignals:
         personalization_level: 개인화 수준 (HIGH: 개인맞춤, MEDIUM: 일반적, LOW: 범용)
         risk_level: 위험도 수준 (HIGH: 고위험, MEDIUM: 중위험, LOW: 저위험)
     """
+
     is_seeking_recommendation: bool
     is_timing_advice: bool
     is_portfolio_allocation: bool
@@ -98,6 +104,7 @@ class IntentAnalysis:
         requires_historical_analysis: 과거 데이터 분석 필요 여부
         sentiment: 감정 상태 (positive/negative/neutral/questioning)
     """
+
     primary_intent: str
     secondary_intents: List[str]
     entities: Dict[str, List[str]]
@@ -118,12 +125,12 @@ class LLMClient:
         self.logger = setup_logger(self.__class__.__name__)
 
     async def complete(
-            self,
-            system_prompt: str,
-            user_prompt: str,
-            model: str = None,
-            temperature: float = None,
-            max_tokens: int = None
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: str = None,
+        temperature: float = None,
+        max_tokens: int = None,
     ) -> Dict:
         """
         LLM 완성 요청
@@ -178,7 +185,7 @@ class LLMClient:
 
                     elif response.status_code == 429:  # Rate limit
                         retry_count += 1
-                        await asyncio.sleep(2 ** retry_count)
+                        await asyncio.sleep(2**retry_count)
                         continue
 
                     else:
@@ -230,7 +237,7 @@ class LLMClient:
         first_brace = text.find("{")
         last_brace = text.rfind("}")
         if first_brace != -1 and last_brace != -1:
-            potential_json = text[first_brace:last_brace + 1]
+            potential_json = text[first_brace : last_brace + 1]
             try:
                 json.loads(potential_json)
                 return potential_json
@@ -253,7 +260,7 @@ class ConditionAgentNode(Node):
         RouteType.GUARDRAIL: "When regulatory compliance check is needed (NOT for blocking investment advice)",
         RouteType.RETRIEVAL: "For general information queries and knowledge retrieval",
         RouteType.FINANCE: "For real-time market data, stock prices, financial metrics",
-        RouteType.ONBOARDING: "For new user registration and profile setup"
+        RouteType.ONBOARDING: "For new user registration and profile setup",
     }
 
     def __init__(self):
@@ -275,7 +282,9 @@ class ConditionAgentNode(Node):
             )
         else:
             self.supabase = None
-            self.logger.warning("Supabase credentials not found. Running in offline mode.")
+            self.logger.warning(
+                "Supabase credentials not found. Running in offline mode."
+            )
 
     def _generate_routing_prompt(self) -> str:
         """동적 라우팅 프롬프트 생성"""
@@ -451,7 +460,7 @@ class ConditionAgentNode(Node):
             raise ProfileError(f"Failed to fetch profile for user {user_id}")
 
     async def _comprehensive_llm_analysis(
-            self, user_input: str, user_profile: Optional[Dict]
+        self, user_input: str, user_profile: Optional[Dict]
     ) -> Dict:
         """
         LLM을 사용한 종합 분석 - 라우팅, 의도분석, 규제체크 통합
@@ -495,7 +504,7 @@ User Request: "{user_input}"
 
 Provide comprehensive analysis with exact structure:
 {{
-    "route": "one of: {', '.join([rt.value for rt in RouteType])}",
+    "route": "one of: {", ".join([rt.value for rt in RouteType])}",
     "overall_confidence": 0.95,
     "reasoning": "detailed reasoning for routing decision",
     "intent_analysis": {{
@@ -538,7 +547,7 @@ Provide comprehensive analysis with exact structure:
             return self._get_intelligent_fallback(user_input)
 
     async def _analyze_investment_advisory_intent(
-            self, user_input: str, user_profile: Dict, routing_result: Dict
+        self, user_input: str, user_profile: Dict, routing_result: Dict
     ) -> Dict:
         """투자자문 의도 정밀 분석"""
         system_prompt = """You are a financial regulatory compliance expert specializing in investment advisory detection.
@@ -590,7 +599,7 @@ Provide detailed compliance analysis:
         return await self.llm_client.complete(system_prompt, user_prompt)
 
     async def _dynamic_data_source_selection(
-            self, user_input: str, routing_result: Dict, user_profile: Dict
+        self, user_input: str, routing_result: Dict, user_profile: Dict
     ) -> List[str]:
         """LLM 기반 동적 데이터 소스 선택"""
         system_prompt = """You are a data architecture expert for a financial AI system.
@@ -645,7 +654,7 @@ Select data sources:
         optional = result.get("optional_sources", [])
 
         all_sources = required + [s for s in optional if s not in required]
-        return all_sources[:Config.MAX_DATA_SOURCES]
+        return all_sources[: Config.MAX_DATA_SOURCES]
 
     def _get_routes_for_prompt(self) -> str:
         """프롬프트용 라우트 설명 생성"""
@@ -670,13 +679,13 @@ Select data sources:
                     "intent_analysis",
                     {
                         "primary_intent": "information_request",
-                        "complexity_level": "MEDIUM"
+                        "complexity_level": "MEDIUM",
                     },
                 ),
                 "overall_confidence": response.get(
                     "overall_confidence", Config.DEFAULT_CONFIDENCE * 0.75
                 ),
-                **response  # 나머지 필드 유지
+                **response,  # 나머지 필드 유지
             }
 
         return response
@@ -799,4 +808,5 @@ async def test_condition_agent():
 if __name__ == "__main__":
     # 독립 실행 테스트
     import asyncio
+
     asyncio.run(test_condition_agent())

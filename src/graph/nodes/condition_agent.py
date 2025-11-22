@@ -6,9 +6,10 @@ LLM 기반 지능형 라우팅 에이전트
 import os
 import json
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 from enum import Enum
 from datetime import datetime
+from dataclasses import dataclass, asdict
 
 import httpx
 from langchain_core.messages import HumanMessage
@@ -19,9 +20,43 @@ from src.models.do import RawResponse
 from src.utils.logger import setup_logger
 
 
+# ===== Configuration =====
+class Config:
+    """전역 설정 상수"""
+    MAX_DATA_SOURCES = 10
+    MAX_RETRIES = 2
+    DEFAULT_CONFIDENCE = 0.8
+    TIMEOUT_SECONDS = 30
+
+    # LLM 설정
+    DEFAULT_MODEL = "openai/gpt-4o-mini"
+    TEMPERATURE = 0.1
+    MAX_TOKENS = 2500
+    TOP_P = 0.95
+
+    # API 설정
+    DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+# ===== Custom Exceptions =====
+class RoutingError(Exception):
+    """라우팅 관련 에러"""
+    pass
+
+
+class LLMError(Exception):
+    """LLM 호출 관련 에러"""
+    pass
+
+
+class ProfileError(Exception):
+    """프로필 조회 관련 에러"""
+    pass
+
+
+# ===== Enums and Data Classes =====
 class RouteType(Enum):
     """라우팅 타입 정의"""
-
     DEBATE = "debate_block"
     GUARDRAIL = "guardrail_layer"
     RETRIEVAL = "retrieval_pipeline"
@@ -29,36 +64,227 @@ class RouteType(Enum):
     ONBOARDING = "onboarding"
 
 
+@dataclass
+class InvestmentAdvisorySignals:
+    """
+    투자자문 의도 분석 결과
+
+    Attributes:
+        is_seeking_recommendation: 투자 추천 요청 여부
+        is_timing_advice: 매매 시점 조언 요청 여부
+        is_portfolio_allocation: 포트폴리오 배분 조언 여부
+        personalization_level: 개인화 수준 (HIGH: 개인맞춤, MEDIUM: 일반적, LOW: 범용)
+        risk_level: 위험도 수준 (HIGH: 고위험, MEDIUM: 중위험, LOW: 저위험)
+    """
+    is_seeking_recommendation: bool
+    is_timing_advice: bool
+    is_portfolio_allocation: bool
+    personalization_level: Literal["HIGH", "MEDIUM", "LOW"]
+    risk_level: Literal["HIGH", "MEDIUM", "LOW"]
+
+
+@dataclass
+class IntentAnalysis:
+    """
+    사용자 의도 분석 결과
+
+    Attributes:
+        primary_intent: 주요 의도
+        secondary_intents: 부가 의도 목록
+        entities: 추출된 엔티티 (회사명, 상품명, 금액 등)
+        complexity_level: 복잡도 수준
+        requires_comparison: 비교 분석 필요 여부
+        requires_realtime_data: 실시간 데이터 필요 여부
+        requires_historical_analysis: 과거 데이터 분석 필요 여부
+        sentiment: 감정 상태 (positive/negative/neutral/questioning)
+    """
+    primary_intent: str
+    secondary_intents: List[str]
+    entities: Dict[str, List[str]]
+    complexity_level: Literal["HIGH", "MEDIUM", "LOW"]
+    requires_comparison: bool
+    requires_realtime_data: bool
+    requires_historical_analysis: bool
+    sentiment: Literal["positive", "negative", "neutral", "questioning"]
+
+
+# ===== LLM Client =====
+class LLMClient:
+    """OpenAI Compatible API 클라이언트"""
+
+    def __init__(self, api_key: str, base_url: str = None):
+        self.api_key = api_key
+        self.base_url = base_url or Config.DEFAULT_BASE_URL
+        self.logger = setup_logger(self.__class__.__name__)
+
+    async def complete(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            model: str = None,
+            temperature: float = None,
+            max_tokens: int = None
+    ) -> Dict:
+        """
+        LLM 완성 요청
+
+        Args:
+            system_prompt: 시스템 프롬프트
+            user_prompt: 사용자 프롬프트
+            model: 사용할 모델 (기본: Config.DEFAULT_MODEL)
+            temperature: 샘플링 온도 (기본: Config.TEMPERATURE)
+            max_tokens: 최대 토큰 수 (기본: Config.MAX_TOKENS)
+
+        Returns:
+            파싱된 JSON 응답
+
+        Raises:
+            LLMError: API 호출 실패 시
+        """
+        model = model or os.getenv("MAIN_LLM_MODEL", Config.DEFAULT_MODEL)
+        temperature = temperature or Config.TEMPERATURE
+        max_tokens = max_tokens or Config.MAX_TOKENS
+
+        if not self.api_key:
+            raise LLMError("API key not found")
+
+        retry_count = 0
+
+        while retry_count < Config.MAX_RETRIES:
+            try:
+                async with httpx.AsyncClient(timeout=Config.TIMEOUT_SECONDS) as client:
+                    response = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                            "top_p": Config.TOP_P,
+                        },
+                    )
+
+                    if response.status_code == 200:
+                        result = response.json()
+                        content = result["choices"][0]["message"]["content"]
+                        return self._parse_json_response(content)
+
+                    elif response.status_code == 429:  # Rate limit
+                        retry_count += 1
+                        await asyncio.sleep(2 ** retry_count)
+                        continue
+
+                    else:
+                        self.logger.error(f"API Error: {response.status_code}")
+                        retry_count += 1
+
+            except asyncio.TimeoutError:
+                self.logger.error("API timeout")
+                retry_count += 1
+
+            except Exception as e:
+                self.logger.error(f"Error calling API: {e}")
+                retry_count += 1
+
+        raise LLMError(f"Failed after {Config.MAX_RETRIES} retries")
+
+    def _parse_json_response(self, content: str) -> Dict:
+        """JSON 응답 파싱"""
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            # JSON 추출 시도
+            cleaned = self._extract_json_from_text(content)
+            return json.loads(cleaned)
+
+    def _extract_json_from_text(self, text: str) -> str:
+        """텍스트에서 JSON 추출"""
+        import re
+
+        patterns = [
+            r"```json\s*(.*?)\s*```",
+            r"```\s*(.*?)\s*```",
+            r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}",
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.DOTALL)
+            for match in matches:
+                try:
+                    if isinstance(match, tuple):
+                        match = match[0]
+                    parsed = json.loads(match)
+                    if isinstance(parsed, dict):
+                        return match
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    continue
+
+        # 최후의 시도
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace != -1:
+            potential_json = text[first_brace:last_brace + 1]
+            try:
+                json.loads(potential_json)
+                return potential_json
+            except json.JSONDecodeError:
+                pass
+
+        raise LLMError("Could not extract JSON from response")
+
+
+# ===== Main Agent Node =====
 class ConditionAgentNode(Node):
     """
     LLM 지능형 라우팅 에이전트 노드
     사용자 요청을 분석하여 적절한 처리 경로로 라우팅
     """
 
+    # 라우트 설명 매핑
+    ROUTE_DESCRIPTIONS = {
+        RouteType.DEBATE: "For comparison analysis, decision-making, multiple perspectives needed",
+        RouteType.GUARDRAIL: "When regulatory compliance check is needed (NOT for blocking investment advice)",
+        RouteType.RETRIEVAL: "For general information queries and knowledge retrieval",
+        RouteType.FINANCE: "For real-time market data, stock prices, financial metrics",
+        RouteType.ONBOARDING: "For new user registration and profile setup"
+    }
+
     def __init__(self):
         super().__init__()
         self.logger = setup_logger(self.__class__.__name__)
 
-        # 환경변수에서 설정 로드
-        self.openrouter_key = os.getenv("OPENAI_API_KEY", "")
+        # LLM 클라이언트 초기화
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        base_url = os.getenv("OPENAI_BASE_URL", Config.DEFAULT_BASE_URL)
+        self.llm_client = LLMClient(api_key, base_url)
+
+        # Supabase 클라이언트 초기화
         self.supabase_url = os.getenv("SUPABASE_URL", "")
         self.supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
 
-        # Supabase 클라이언트 초기화
         if self.supabase_url and self.supabase_key:
             self.supabase: Optional[Client] = create_client(
                 self.supabase_url, self.supabase_key
             )
         else:
             self.supabase = None
-            self.logger.warning(
-                "Supabase credentials not found. Running in offline mode."
-            )
+            self.logger.warning("Supabase credentials not found. Running in offline mode.")
 
-        self.openrouter_base_url = "https://openrouter.ai/api/v1"
+    def _generate_routing_prompt(self) -> str:
+        """동적 라우팅 프롬프트 생성"""
+        routes_description = []
+        for i, route_type in enumerate(RouteType, 1):
+            description = self.ROUTE_DESCRIPTIONS.get(route_type)
+            routes_description.append(f"{i}. {route_type.value}: {description}")
 
-        # 시스템 프롬프트
-        self.system_prompt = """You are an intelligent routing agent for a financial AI system.
+        return f"""You are an intelligent routing agent for a financial AI system.
         Your role is to analyze user requests comprehensively and determine the most appropriate processing path.
         
         Consider all aspects:
@@ -69,31 +295,16 @@ class ConditionAgentNode(Node):
         - Edge cases and exceptions
         
         Available routes:
-        1. debate_block: For comparison analysis, decision-making, multiple perspectives needed
-        2. guardrail_layer: When regulatory compliance check is needed (NOT for blocking investment advice)
-        3. retrieval_pipeline: For general information queries and knowledge retrieval
-        4. finance_agent: For real-time market data, stock prices, financial metrics
-        5. onboarding: For new user registration and profile setup
+        {chr(10).join(routes_description)}
         
         Be flexible and context-aware in your routing decisions."""
 
     def _run(self, state: dict) -> dict:
-        """
-        Supervisor 노드에서 호출되는 메인 실행 함수
-        기존 프로젝트 패턴 사용
-        """
+        """Supervisor 노드에서 호출되는 메인 실행 함수"""
         try:
-            # 상태에서 필요한 정보 추출
             messages = state.get("messages", [])
             if not messages:
-                return {
-                    "messages": [
-                        HumanMessage(
-                            content="Error: No messages in state",
-                            name="condition_agent",
-                        )
-                    ]
-                }
+                raise RoutingError("No messages in state")
 
             last_message = messages[-1]
             user_input = (
@@ -102,7 +313,6 @@ class ConditionAgentNode(Node):
                 else str(last_message)
             )
 
-            # 사용자 ID 추출
             user_id = state.get("user_id", "default_user")
 
             # 비동기 함수 실행
@@ -115,17 +325,14 @@ class ConditionAgentNode(Node):
             finally:
                 loop.close()
 
-            # 결과 포맷팅
             response_content = self._format_routing_result(result)
-
             self.logger.info(f"Routing decision: {result['route']}")
-
 
             return {
                 "messages": [
                     HumanMessage(content=response_content, name="condition_agent")
                 ],
-                "routing_result": result,  # 라우팅 결과를 state에 저장
+                "routing_result": result,
             }
 
         except Exception as e:
@@ -140,11 +347,8 @@ class ConditionAgentNode(Node):
             }
 
     def _invoke(self, query: str) -> RawResponse:
-        """
-        API 엔드포인트용 함수 - query를 직접 문자열로 받음
-        """
+        """API 엔드포인트용 함수"""
         try:
-            # 비동기 함수 실행
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -154,7 +358,6 @@ class ConditionAgentNode(Node):
             finally:
                 loop.close()
 
-            # JSON 형태로 결과 반환
             return RawResponse(answer=json.dumps(result, ensure_ascii=False, indent=2))
 
         except Exception as e:
@@ -163,25 +366,31 @@ class ConditionAgentNode(Node):
 
     async def process_request(self, user_input: str, user_id: str) -> Dict[str, Any]:
         """
-        메인 라우팅 처리
-        """
+        메인 라우팅 처리 파이프라인
 
-        # 1. 사용자 프로필 조회 (Supabase DB)
+        Args:
+            user_input: 사용자 입력
+            user_id: 사용자 ID
+
+        Returns:
+            라우팅 결과 딕셔너리
+        """
+        # 1. 사용자 프로필 조회
         user_profile = await self._get_user_profile_from_db(user_id)
 
-        # 2. LLM 기반 종합 분석 (라우팅 + 의도 분석 + 가드레일 체크 통합)
+        # 2. LLM 기반 종합 분석
         routing_result = await self._comprehensive_llm_analysis(
             user_input, user_profile
         )
 
-        # 3. 투자자문 의도 정밀 분석 (추가 검증)
+        # 3. 투자자문 의도 정밀 분석 (필요시)
         if routing_result.get("needs_compliance_check", False):
             compliance_analysis = await self._analyze_investment_advisory_intent(
                 user_input, user_profile, routing_result
             )
             routing_result["compliance_analysis"] = compliance_analysis
 
-        # 4. 동적 데이터 소스 선택 (LLM 기반)
+        # 4. 동적 데이터 소스 선택
         data_sources = await self._dynamic_data_source_selection(
             user_input, routing_result, user_profile
         )
@@ -198,7 +407,9 @@ class ConditionAgentNode(Node):
             "context": {
                 "user_input": user_input,
                 "timestamp": datetime.now().isoformat(),
-                "overall_confidence": routing_result.get("overall_confidence", 0.8),
+                "overall_confidence": routing_result.get(
+                    "overall_confidence", Config.DEFAULT_CONFIDENCE
+                ),
             },
         }
 
@@ -210,15 +421,18 @@ class ConditionAgentNode(Node):
 
     async def _get_user_profile_from_db(self, user_id: str) -> Optional[Dict]:
         """
-        Supabase DB에서 실제 사용자 프로필 조회
-        테이블: user_profile
+        Supabase DB에서 사용자 프로필 조회
+
+        Args:
+            user_id: 사용자 ID
+
+        Returns:
+            사용자 프로필 딕셔너리 또는 None
         """
         if not self.supabase:
-            # 오프라인 모드 - 최소 프로필 반환
             return {"user_id": user_id, "status": "offline_mode"}
 
         try:
-            # user_profile 테이블 조회
             response = (
                 self.supabase.table("user_profile")
                 .select("*")
@@ -230,22 +444,22 @@ class ConditionAgentNode(Node):
             if response.data:
                 return response.data
 
-            # 사용자가 없는 경우 온보딩 필요
-            return None
+            return None  # 온보딩 필요
 
         except Exception as e:
             self.logger.error(f"Error fetching user profile: {e}")
-            # DB 오류시에도 기본 처리 가능하도록
-            return {"user_id": user_id, "status": "error", "error": str(e)}
+            raise ProfileError(f"Failed to fetch profile for user {user_id}")
 
     async def _comprehensive_llm_analysis(
-        self, user_input: str, user_profile: Optional[Dict]
+            self, user_input: str, user_profile: Optional[Dict]
     ) -> Dict:
         """
         LLM을 사용한 종합 분석 - 라우팅, 의도분석, 규제체크 통합
-        """
 
-        system_prompt = """You are a comprehensive financial AI routing expert.
+        Returns:
+            분석 결과 딕셔너리
+        """
+        system_prompt = f"""You are a comprehensive financial AI routing expert.
         Analyze the user request holistically and make intelligent routing decisions.
         
         Your analysis should consider:
@@ -256,11 +470,7 @@ class ConditionAgentNode(Node):
         5. Edge cases and exceptions
         
         Routing options:
-        - debate_block: Comparison, pros/cons analysis, multiple viewpoints
-        - guardrail_layer: Regulatory compliance verification needed
-        - retrieval_pipeline: Information retrieval, Q&A, explanations
-        - finance_agent: Real-time market data, prices, financial metrics
-        - onboarding: New user or profile update needed
+        {self._get_routes_for_prompt()}
         
         For investment advisory detection:
         - Analyze if the request seeks personalized investment recommendations
@@ -271,7 +481,6 @@ class ConditionAgentNode(Node):
         
         Respond in structured JSON format."""
 
-        # 프로필 정보 포맷팅
         profile_info = (
             self._format_profile_for_prompt(user_profile)
             if user_profile
@@ -284,9 +493,9 @@ User Profile:
 
 User Request: "{user_input}"
 
-Provide comprehensive analysis:
+Provide comprehensive analysis with exact structure:
 {{
-    "route": "selected_route",
+    "route": "one of: {', '.join([rt.value for rt in RouteType])}",
     "overall_confidence": 0.95,
     "reasoning": "detailed reasoning for routing decision",
     "intent_analysis": {{
@@ -318,20 +527,20 @@ Provide comprehensive analysis:
         "intent_confidence": 0.90,
         "compliance_confidence": 0.85
     }},
-    "edge_case_handling": "any special considerations or exceptions"
+    "edge_case_handling": "any special considerations"
 }}
 """
 
-        return await self._call_openrouter_llm(system_prompt, user_prompt)
+        try:
+            result = await self.llm_client.complete(system_prompt, user_prompt)
+            return self._validate_and_enhance_response(result)
+        except LLMError:
+            return self._get_intelligent_fallback(user_input)
 
     async def _analyze_investment_advisory_intent(
-        self, user_input: str, user_profile: Dict, routing_result: Dict
+            self, user_input: str, user_profile: Dict, routing_result: Dict
     ) -> Dict:
-        """
-        투자자문 의도 정밀 분석
-        가드레일이 아닌 의도 분석 용도
-        """
-
+        """투자자문 의도 정밀 분석"""
         system_prompt = """You are a financial regulatory compliance expert specializing in investment advisory detection.
         
         Analyze if the user request constitutes investment advisory that requires licensed professionals.
@@ -378,15 +587,12 @@ Provide detailed compliance analysis:
 }}
 """
 
-        return await self._call_openrouter_llm(system_prompt, user_prompt)
+        return await self.llm_client.complete(system_prompt, user_prompt)
 
     async def _dynamic_data_source_selection(
-        self, user_input: str, routing_result: Dict, user_profile: Dict
+            self, user_input: str, routing_result: Dict, user_profile: Dict
     ) -> List[str]:
-        """
-        LLM 기반 동적 데이터 소스 선택
-        """
-
+        """LLM 기반 동적 데이터 소스 선택"""
         system_prompt = """You are a data architecture expert for a financial AI system.
         
         Select optimal data sources based on the request context and routing decision.
@@ -433,126 +639,51 @@ Select data sources:
 }}
 """
 
-        result = await self._call_openrouter_llm(system_prompt, user_prompt)
+        result = await self.llm_client.complete(system_prompt, user_prompt)
 
-        # 우선순위에 따른 소스 정렬
         required = result.get("required_sources", [])
         optional = result.get("optional_sources", [])
 
-        # 중복 제거 및 우선순위 반영
         all_sources = required + [s for s in optional if s not in required]
+        return all_sources[:Config.MAX_DATA_SOURCES]
 
-        return all_sources[:10]  # 최대 10개 소스로 제한
+    def _get_routes_for_prompt(self) -> str:
+        """프롬프트용 라우트 설명 생성"""
+        lines = []
+        for route_type in RouteType:
+            desc = self.ROUTE_DESCRIPTIONS.get(route_type)
+            lines.append(f"- {route_type.value}: {desc}")
+        return "\n".join(lines)
 
-    async def _call_openrouter_llm(
-        self, system_prompt: str, user_prompt: str, model: str = None
-    ) -> Dict:
-        """..
-        OpenRouter LLM API 호출 - 향상된 에러 처리 및 재시도
-        """
-        # 모델 기본값 설정
-        if model is None:
-            model = os.getenv(
-                "MAIN_LLM_MODEL", "openai/gpt-4o-mini"
-            )  # 환경변수에서 모델 가져오기
-
-        if not self.openrouter_key:
-            self.logger.warning("OpenRouter API key not found. Using fallback.")
-            return self._get_intelligent_fallback(user_prompt)
-
-        max_retries = 2
-        retry_count = 0
-
-        while retry_count < max_retries:
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
-                        f"{self.openrouter_base_url}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.openrouter_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": model,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            "temperature": 0.1,  # 일관성 있는 응답
-                            "max_tokens": 2500,
-                            "top_p": 0.95,
-                        },
-                    )
-
-                    if response.status_code == 200:
-                        result = response.json()
-                        content = result["choices"][0]["message"]["content"]
-
-                        # JSON 파싱 및 검증
-                        try:
-                            parsed = json.loads(content)
-                            # 필수 필드 검증
-                            if self._validate_llm_response(parsed):
-                                return parsed
-                            else:
-                                self.logger.warning("Invalid LLM response structure")
-                                return self._enhance_response(parsed)
-                        except json.JSONDecodeError:
-                            # JSON 추출 재시도
-                            cleaned = self._extract_json_from_text(content)
-                            parsed = json.loads(cleaned)
-                            return (
-                                parsed
-                                if self._validate_llm_response(parsed)
-                                else self._enhance_response(parsed)
-                            )
-
-                    elif response.status_code == 429:  # Rate limit
-                        retry_count += 1
-                        await asyncio.sleep(2**retry_count)  # Exponential backoff
-                        continue
-
-                    else:
-                        self.logger.error(
-                            f"OpenRouter API Error: {response.status_code}"
-                        )
-                        retry_count += 1
-
-            except asyncio.TimeoutError:
-                self.logger.error("OpenRouter API timeout")
-                retry_count += 1
-
-            except Exception as e:
-                self.logger.error(f"Error calling OpenRouter API: {e}")
-                retry_count += 1
-
-        # 모든 재시도 실패
-        return self._get_intelligent_fallback(user_prompt)
-
-    def _validate_llm_response(self, response: Dict) -> bool:
-        """LLM 응답 검증"""
+    def _validate_and_enhance_response(self, response: Dict) -> Dict:
+        """LLM 응답 검증 및 보강"""
         required_fields = ["route", "reasoning", "intent_analysis"]
-        return all(field in response for field in required_fields)
 
-    def _enhance_response(self, partial_response: Dict) -> Dict:
-        """불완전한 응답 보강"""
-        default_structure = {
-            "route": partial_response.get("route", "retrieval_pipeline"),
-            "reasoning": partial_response.get(
-                "reasoning", "Automated routing based on partial analysis"
-            ),
-            "intent_analysis": partial_response.get(
-                "intent_analysis",
-                {"primary_intent": "information_request", "complexity_level": "MEDIUM"},
-            ),
-            "overall_confidence": partial_response.get("overall_confidence", 0.6),
-        }
-        return {**default_structure, **partial_response}
+        if not all(field in response for field in required_fields):
+            # 필수 필드 보강
+            return {
+                "route": response.get("route", RouteType.RETRIEVAL.value),
+                "reasoning": response.get(
+                    "reasoning", "Automated routing based on partial analysis"
+                ),
+                "intent_analysis": response.get(
+                    "intent_analysis",
+                    {
+                        "primary_intent": "information_request",
+                        "complexity_level": "MEDIUM"
+                    },
+                ),
+                "overall_confidence": response.get(
+                    "overall_confidence", Config.DEFAULT_CONFIDENCE * 0.75
+                ),
+                **response  # 나머지 필드 유지
+            }
+
+        return response
 
     def _get_intelligent_fallback(self, user_prompt: str) -> Dict:
-        """지능형 폴백 - 간단한 휴리스틱 기반"""
-        # 키워드 기반 간단한 분류
-        route = "retrieval_pipeline"
+        """지능형 폴백 - 휴리스틱 기반"""
+        route = RouteType.RETRIEVAL.value
 
         comparison_keywords = ["비교", "vs", "versus", "차이", "어느", "어떤", "선택"]
         realtime_keywords = ["현재", "지금", "실시간", "가격", "시세", "주가"]
@@ -561,11 +692,11 @@ Select data sources:
         lower_prompt = user_prompt.lower()
 
         if any(keyword in lower_prompt for keyword in comparison_keywords):
-            route = "debate_block"
+            route = RouteType.DEBATE.value
         elif any(keyword in lower_prompt for keyword in realtime_keywords):
-            route = "finance_agent"
+            route = RouteType.FINANCE.value
         elif any(keyword in lower_prompt for keyword in risk_keywords):
-            route = "guardrail_layer"
+            route = RouteType.GUARDRAIL.value
 
         return {
             "route": route,
@@ -575,8 +706,9 @@ Select data sources:
                 "primary_intent": "general_inquiry",
                 "complexity_level": "MEDIUM",
                 "requires_comparison": "비교" in lower_prompt,
-                "requires_realtime_data": "실시간" in lower_prompt
-                or "현재" in lower_prompt,
+                "requires_realtime_data": any(
+                    k in lower_prompt for k in ["실시간", "현재"]
+                ),
             },
             "needs_compliance_check": False,
         }
@@ -611,46 +743,6 @@ Select data sources:
 - 이유: {result.get("routing_reasoning", "N/A")}
 """
 
-    def _extract_json_from_text(self, text: str) -> str:
-        """텍스트에서 JSON 추출"""
-        import re
-
-        # 다양한 JSON 패턴 시도
-        patterns = [
-            r"```json\s*(.*?)\s*```",
-            r"```\s*(.*?)\s*```",
-            r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}",  # 중첩된 JSON
-        ]
-
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.DOTALL)
-            for match in matches:
-                try:
-                    # 매치된 텍스트가 튜플인 경우 처리
-                    if isinstance(match, tuple):
-                        match = match[0]
-
-                    # JSON 파싱 시도
-                    parsed = json.loads(match)
-                    if isinstance(parsed, dict) and len(parsed) > 0:
-                        return match
-                except (json.JSONDecodeError, ValueError, TypeError):  # 수정된 부분
-                    continue
-
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            potential_json = text[first_brace : last_brace + 1]
-            try:
-                json.loads(potential_json)
-                return potential_json
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # JSON을 찾을 수 없는 경우
-        self.logger.warning("Could not extract valid JSON from LLM response")
-        return '{"route": "retrieval_pipeline", "reasoning": "JSON extraction failed"}'
-
     async def _save_interaction_log(self, user_id: str, result: Dict):
         """상호작용 로그를 Supabase에 저장"""
         try:
@@ -660,7 +752,9 @@ Select data sources:
                 "intent": json.dumps(
                     result.get("intent_analysis", {}), ensure_ascii=False
                 ),
-                "confidence": result.get("context", {}).get("overall_confidence", 0.8),
+                "confidence": result.get("context", {}).get(
+                    "overall_confidence", Config.DEFAULT_CONFIDENCE
+                ),
                 "data_sources": json.dumps(
                     result.get("data_sources", []), ensure_ascii=False
                 ),
@@ -673,11 +767,10 @@ Select data sources:
             self.supabase.table("interaction_logs").insert(log_data).execute()
 
         except Exception as e:
-
             self.logger.error(f"Failed to save interaction log: {e}")
 
 
-# ===== 테스트 헬퍼 함수 =====
+# ===== 테스트 헬퍼 =====
 async def test_condition_agent():
     """독립 실행 테스트"""
     agent = ConditionAgentNode()
@@ -693,14 +786,17 @@ async def test_condition_agent():
     for query in test_cases:
         print(f"\n{'=' * 60}")
         print(f"Query: {query}")
-        result = await agent.process_request(query, "test_user")
-        print(f"Route: {result['route']}")
-        print(f"Confidence: {result['context']['overall_confidence']:.1%}")
-        print(f"Reasoning: {result['routing_reasoning'][:100]}...")
+
+        try:
+            result = await agent.process_request(query, "test_user")
+            print(f"Route: {result['route']}")
+            print(f"Confidence: {result['context']['overall_confidence']:.1%}")
+            print(f"Reasoning: {result['routing_reasoning'][:100]}...")
+        except Exception as e:
+            print(f"Error: {e}")
 
 
 if __name__ == "__main__":
     # 독립 실행 테스트
     import asyncio
-
     asyncio.run(test_condition_agent())
